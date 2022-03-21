@@ -1,0 +1,8 @@
+*.so
+vtk_openvr/lib
+*.egg-info
+build/
+cmake-build-debug/
+cmake-build-release/
+.idea/
+bin/
