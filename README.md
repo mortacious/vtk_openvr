@@ -43,7 +43,7 @@ or
 
 ### Windows 
 
-¯\_(ツ)_/¯
+¯\\_(ツ)_/¯
 
 
 ## Acknowlegements
