@@ -1,7 +1,7 @@
 # VTK OpenVR
 
 Build VTK's [Rendering/OpenVR](https://github.com/Kitware/VTK/tree/master/Rendering/OpenVR) 
-module as a standalone installable library with optional python bindings.
+module as a standalone installable python package.
 
 Due to relying on the VTK module build system, this library requires VTK 9.0 or above.
 
@@ -12,17 +12,8 @@ Due to relying on the VTK module build system, this library requires VTK 9.0 or 
 ```bash
 git clone https://github.com/mortacious/vtk-openvr.git
 cd vtk-openvr
-python setup.py install
-```
-
-
-### From source (C++)
-```bash
-git clone https://github.com/mortacious/vtk-openvr.git
-cd vtk-openvr
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make && sudo make install
+python setup.py bdist_wheel
+python -m pip install dist/<generated wheel-file>
 ```
 
 ## Usage
