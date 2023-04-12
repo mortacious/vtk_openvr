@@ -1,108 +1,195 @@
 import os
 import re
 import sys
-import pathlib
+from pathlib import Path
 import platform
 import subprocess
-
-from distutils.version import LooseVersion
-from setuptools import Extension
-from setuptools.command.build_ext import build_ext
+import shutil
 from setuptools import setup, find_packages
-
-class CMakeExtension(Extension):
-    def __init__(self, name, sourcedir='', target_name='', cmake_args=(), debug=False):
-        Extension.__init__(self, name, sources=[])
-        self.sourcedir = os.path.abspath(sourcedir)
-        if not target_name:
-            target_name = os.path.basename(self.name) + "Python"  # for vtk
-        self.target_name = target_name
-        self.cmake_args = list(cmake_args)
-        self.debug = debug
+from skbuild import setup
 
 
-class CMakeBuild(build_ext):
-    def run(self):
-        try:
-            out = subprocess.check_output(['cmake', '--version'])
-        except OSError:
-            raise RuntimeError(
-                "CMake must be installed to build the following extensions: " +
-                ", ".join(e.name for e in self.extensions))
+vtk_version = os.getenv('VTK_WHEEL_SDK_VERSION', None)
+if vtk_version is None:
+    import vtk
+    vtk_version = vtk.__version__
 
-        if platform.system() == "Windows":
-            cmake_version = LooseVersion(re.search(r'version\s*([\d.]+)',
-                                                   out.decode()).group(1))
-            if cmake_version < '3.1.0':
-                raise RuntimeError("CMake >= 3.1.0 is required on Windows")
+vtk_openvr_module_source_dir = Path(__file__).parent.resolve()
 
-        for ext in self.extensions:
-            print(ext.name)
-            self.build_extension(ext)
+def auto_download_vtk_wheel_sdk():
+    # Automatically download the VTK wheel SDK based upon the current platform
+    # and python version.
+    # If the download location changes, we may need to change the logic here.
+    # Returns the path to the unpacked SDK.
 
-    def build_extension(self, ext):
-        extdir = os.path.abspath(
-            os.path.dirname(self.get_ext_fullpath(ext.name)))
-        # required for auto-detection of auxiliary "native" libs
-        #if not extdir.endswith(os.path.sep):
-        #    extdir += os.path.sep
-        #extdir += ext.target_pkg
-        cmake_args = ext.cmake_args
-        from distutils import sysconfig
-        lib_dir = str(pathlib.Path(sysconfig.get_python_lib()).parent)
-        include_dir = sysconfig.get_python_inc()
-        cmake_args += [#'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir,
-            '-DCMAKE_INSTALL_PREFIX=' + extdir,
-            '-DPython3_EXECUTABLE=' + sys.executable,
-            '-DPython3_LIBRARY=' + lib_dir,
-            '-DPython3_INCLUDE_DIR=' + include_dir]
+    base_url = 'https://vtk.org/files/wheel-sdks/'
+    prefix = 'vtk-wheel-sdk'
+    default_sdk_version = vtk_version
+    # The user can set the sdk version via an environment variable
+    sdk_version = os.getenv('VTK_WHEEL_SDK_VERSION', default_sdk_version)
+    py_version_short = ''.join(map(str, sys.version_info[:2]))
 
-        # Pile all .so in one place and use $ORIGIN as RPATH
-        #cmake_args += ["-DCMAKE_BUILD_WITH_INSTALL_RPATH=TRUE"]
+    py_version = f'cp{py_version_short}-cp{py_version_short}'
+    if sys.version_info[:2] < (3, 8):
+        # Need to add 'm' at the end
+        py_version += 'm'
 
-        try:
-            # if running in da conda environment
-            pref = os.environ['CONDA_PREFIX']
-            cmake_args += ["-DCMAKE_INSTALL_RPATH={}".format(";".join((".","$ORIGIN", "{}/lib".format(pref))))]
-        except KeyError:
-            cmake_args += ["-DCMAKE_INSTALL_RPATH={}".format(";".join((".","$ORIGIN")))]
+    platform_suffixes = {
+        'linux': 'manylinux_2_17_x86_64.manylinux2014_x86_64',
+        'darwin': 'macosx_10_10_x86_64',
+        'win32': 'win_amd64',
+    }
 
-        cfg = 'Debug' if ext.debug else 'Release'
-        build_args = ['--config', cfg]
+    if sys.platform not in platform_suffixes:
+        raise NotImplementedError(sys.platform)
 
-        cmake_args += ['-DCMAKE_CXX_FLAGS_DEBUG="-g"',
-                       '-DCMAKE_CXX_FLAGS_RELEASE="-O3"']
+    platform_suffix = platform_suffixes[sys.platform]
 
-        if platform.system() == "Windows":
-            cmake_args += ['-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{}={}'.format(
-                cfg.upper(),
-                ext.outputdir)]
-            if sys.maxsize > 2**32:
-                cmake_args += ['-A', 'x64']
-            build_args += ['--', '/m']
-        else:
-            cmake_args += ['-DCMAKE_BUILD_TYPE=' + cfg]
-            build_args += ['--', '-j4']
+    if sys.platform == 'darwin':
+        is_arm = (
+            platform.machine() == 'arm64' or
+            # ARCHFLAGS: see https://github.com/pypa/cibuildwheel/discussions/997
+            os.getenv('ARCHFLAGS') == '-arch arm64'
+        )
+        if is_arm:
+            # It's an arm64 build
+            platform_suffix = 'macosx_11_0_arm64'
 
-        env = os.environ.copy()
-        env['CXXFLAGS'] = '{} -DVERSION_INFO=\\"{}\\"'.format(
-            env.get('CXXFLAGS', ''),
-            self.distribution.get_version())
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
-        subprocess.check_call(['cmake', ext.sourcedir] + cmake_args,
-                              cwd=self.build_temp, env=env)
+    dir_name = f'{prefix}-{sdk_version}-{py_version}-{platform_suffix}'
+    default_install_path = Path('.').resolve() / f'_deps/{dir_name}'
+    install_path = Path(os.getenv('VTK_WHEEL_SDK_INSTALL_PATH',
+                                  default_install_path))
 
-        subprocess.check_call(['cmake', '--build', '.', '--target', ext.target_name] + build_args,
-                              cwd=self.build_temp)
-        subprocess.check_call(['cmake', '--install', '.'],
-                              cwd=self.build_temp)
-        print()  # Add an empty line for cleaner output
+    if install_path.exists():
+        # It already exists, just return it
+        return install_path.as_posix()
 
+    # Need to download it
+    full_name = f'{prefix}-{sdk_version}-{py_version}-{platform_suffix}.tar.xz'
+    url = f'{base_url}{full_name}'
+
+    script_path = str(vtk_openvr_module_source_dir /
+                      'FetchFromUrl.cmake')
+
+    cmd = [
+        'cmake',
+        f'-DFETCH_FROM_URL_PROJECT_NAME={prefix}',
+        f'-DFETCH_FROM_URL_INSTALL_LOCATION={install_path.as_posix()}',
+        f'-DFETCH_FROM_URL_URL={url}',
+        '-P', script_path,
+    ]
+    subprocess.check_call(cmd)
+
+    return install_path.as_posix()
+
+
+def auto_download_vtk_external_module():
+    # Automatically download the VTKExternalModule repository.
+    # Returns the path to the VTKExternalModule directory.
+
+    external_module_path = Path('.').resolve() / '_deps/VTKExternalModule'
+    if external_module_path.exists():
+        # It must have already been downloaded. Just return it.
+        return external_module_path.as_posix()
+
+    # Run the script to download it
+    script_path = str(vtk_openvr_module_source_dir /
+                      'FetchVTKExternalModule.cmake')
+    cmd = [
+        'cmake',
+        '-DFETCH_VTKExternalModule_INSTALL_LOCATION=' +
+        external_module_path.as_posix(),
+        '-P', script_path,
+    ]
+    subprocess.check_call(cmd)
+    return external_module_path.as_posix()
+
+
+def auto_download_vtk_source_tree():
+    # Automatically downloads the vtk source tree corresponding to the installed vtk version
+
+    vtk_source_path = Path('.').resolve() / '_deps/VTK'
+    if vtk_source_path.exists():
+        # It must have already been downloaded. Just return it.
+        return vtk_source_path.as_posix()
+    # Run the script to download it
+    script_path = str(vtk_openvr_module_source_dir /
+                      'FetchVTKSourcetree.cmake')
+    cmd = [
+        'cmake',
+        '-DFETCH_VTK_INSTALL_LOCATION=' +
+            vtk_source_path.as_posix(),
+        '-DVTK_VERSION=' + str(vtk_version),
+        '-P', script_path,
+    ]
+    subprocess.check_call(cmd)
+    return vtk_source_path.as_posix()
+
+
+vtk_wheel_sdk_path = os.getenv('VTK_WHEEL_SDK_PATH')
+if vtk_wheel_sdk_path is None:
+    vtk_wheel_sdk_path = auto_download_vtk_wheel_sdk()
+
+# check that vtkRenderingopenvr is not part of the wheel
+cmake_glob = list(Path(vtk_wheel_sdk_path).glob('**/vtkmodules/vtkRenderingOpenVR.pyi'))
+if len(cmake_glob) >= 1:
+    raise ValueError("RenderingOpenVR is already part of the python wheels for vtk. Aborting.")
+
+# Find the cmake dir
+cmake_glob = list(Path(vtk_wheel_sdk_path).glob('**/headers/cmake'))
+if len(cmake_glob) != 1:
+    raise Exception('Unable to find cmake directory')
+
+vtk_wheel_sdk_cmake_path = cmake_glob[0]
+
+vtk_external_module_path = os.getenv('VTK_EXTERNAL_MODULE_PATH')
+if vtk_external_module_path is None:
+    # If it was not provided, clone it into a temporary directory
+    # Since we are using pyproject.toml, it will get removed automatically
+    vtk_external_module_path = auto_download_vtk_external_module()
+
+
+vtk_source_tree_path = os.getenv('VTK_SOURCE_TREE_PATH')
+if vtk_source_tree_path is None:
+    # If it was not provided, clone it into a temporary directory
+    # Since we are using pyproject.toml, it will get removed automatically
+    vtk_source_tree_path = auto_download_vtk_source_tree()
+
+vtk_openvr_sources_path = (Path(vtk_source_tree_path) / "Rendering/OpenVR")
+
+
+python3_executable = os.getenv('Python3_EXECUTABLE')
+if python3_executable is None:
+    python3_executable = shutil.which('python')
+
+if python3_executable is None:
+    msg = 'Unable find python executable, please set Python3_EXECUTABLE'
+    raise Exception(msg)
+
+
+cmake_args = [
+    '-DVTK_MODULE_NAME:STRING=RenderingOpenVR',
+    f'-DVTK_MODULE_SOURCE_DIR:PATH={vtk_openvr_sources_path}',
+    f'-DVTK_MODULE_CMAKE_MODULE_PATH:PATH={vtk_wheel_sdk_cmake_path}',
+    f'-DVTK_DIR:PATH={vtk_wheel_sdk_cmake_path}',
+    '-DCMAKE_INSTALL_LIBDIR:STRING=lib',
+    f'-DPython3_EXECUTABLE:FILEPATH={python3_executable}',
+    '-DVTK_WHEEL_BUILD:BOOL=ON',
+    '-S', vtk_external_module_path,
+]
+
+if sys.platform == 'linux':
+    #if os.getenv('LINUX_VTK_OPENXR_USE_COMPATIBLE_ABI') == '1':
+    # If building locally, it is necessary to set this in order to
+    # produce a wheel that can be used. Otherwise, the VTK symbols
+    # will not match those in the actual VTK wheel.
+    cmake_args.append('-DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=0')
+else:
+    raise ValueError("Only linux is supported right now.")
 
 setup(
     name="vtk-openvr",
-    version="0.1.0",
+    version=vtk_version,
     author="Felix Igelbrink",
     author_email="felix.igelbrink@uni-osnabrueck.de",
     description="VTK's openVR module built as a separate python package",
@@ -110,13 +197,9 @@ setup(
     classifiers=[
         'Private :: Do Not Upload to pypi server',
     ],
-    packages=find_packages(include=['vtk_openvr']),
-    ext_modules=[CMakeExtension('vtk_openvr', target_name="all",
-                                cmake_args=["-DBUILD_PYTHON=ON"], debug=False)],
-    cmdclass=dict(build_ext=CMakeBuild),
+    packages=['vtkmodules', 'vtk_openvr'],
+    package_dir={'vtkmodules': 'lib/vtkmodules'},
     install_requires=['numpy'],
-    extras_require={
-        'examples': ['pyvista'],
-    },
+    cmake_args=cmake_args,
     zip_safe=False,
 )

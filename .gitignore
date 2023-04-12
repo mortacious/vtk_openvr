@@ -6,3 +6,12 @@ cmake-build-debug/
 cmake-build-release/
 .idea/
 bin/
+__pycache__/
+_skbuild/
+_deps/
+vtk-build/
+vtk-subbuild/
+vtk-wheel-sdk-build/
+vtk-wheel-sdk-subbuild/
+vtkexternalmodule-build
+vtkexternalmodule-subbuild/
